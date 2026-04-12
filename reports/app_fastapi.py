@@ -1,12 +1,11 @@
-# =========================================================
-# IMPORT LIBRARIES
-# =========================================================
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List
 
+import pickle
 import numpy as np
 import pandas as pd
 import torch
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
@@ -28,24 +27,41 @@ from content_based_nlp import (
     recommend_for_new_user_by_preference
 )
 from ncf_recommender import (
-    encode_ids,
-    train_valid_split,
-    RatingsDataset,
     NeuralCollaborativeFiltering,
-    train_ncf_model,
     recommend_ncf
 )
-from torch.utils.data import DataLoader
 
 
 # =========================================================
-# FASTAPI APP
+# PATHS
 # =========================================================
-app = FastAPI(
-    title="Movie Recommendation Service",
-    description="FastAPI Recommendation API with Hybrid + Similar Items endpoints",
-    version="1.0.0"
-)
+BASE_DIR = Path(__file__).resolve().parent
+ARTIFACTS_DIR = BASE_DIR / "saved_models"
+
+NCF_MODEL_PATH = ARTIFACTS_DIR / "ncf_model.pt"
+USER_TO_INDEX_PATH = ARTIFACTS_DIR / "user_to_index.pkl"
+ITEM_TO_INDEX_PATH = ARTIFACTS_DIR / "item_to_index.pkl"
+
+
+# =========================================================
+# GLOBAL OBJECTS
+# =========================================================
+users_df = None
+movies_df = None
+ratings_df = None
+
+user_item_matrix = None
+predicted_ratings_df = None
+
+movies_with_desc = None
+tfidf_matrix = None
+content_similarity_df = None
+
+ncf_model = None
+user_to_index = None
+item_to_index = None
+
+popularity_lookup = None
 
 
 # =========================================================
@@ -75,27 +91,6 @@ class SimilarItemResponse(BaseModel):
 
 
 # =========================================================
-# GLOBAL OBJECTS
-# =========================================================
-users_df = None
-movies_df = None
-ratings_df = None
-
-user_item_matrix = None
-predicted_ratings_df = None
-
-movies_with_desc = None
-tfidf_matrix = None
-content_similarity_df = None
-
-ncf_model = None
-user_to_index = None
-item_to_index = None
-
-popularity_lookup = None
-
-
-# =========================================================
 # HELPERS
 # =========================================================
 def build_popularity_lookup(movie_popularity_features: pd.DataFrame) -> pd.DataFrame:
@@ -117,6 +112,39 @@ def min_max_normalize(score_series: pd.Series) -> pd.Series:
         return pd.Series(0.0, index=score_series.index)
 
     return (score_series - min_val) / (max_val - min_val)
+
+
+def load_pickle_file(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Required file not found: {path}")
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def load_ncf_artifacts():
+    if not NCF_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"NCF model file not found: {NCF_MODEL_PATH}\n"
+            f"Train and save the model first."
+        )
+    if not USER_TO_INDEX_PATH.exists():
+        raise FileNotFoundError(
+            f"user_to_index file not found: {USER_TO_INDEX_PATH}"
+        )
+    if not ITEM_TO_INDEX_PATH.exists():
+        raise FileNotFoundError(
+            f"item_to_index file not found: {ITEM_TO_INDEX_PATH}"
+        )
+
+    local_user_to_index = load_pickle_file(USER_TO_INDEX_PATH)
+    local_item_to_index = load_pickle_file(ITEM_TO_INDEX_PATH)
+
+    model = torch.load(NCF_MODEL_PATH, map_location=torch.device("cpu"))
+
+    if hasattr(model, "eval"):
+        model.eval()
+
+    return model, local_user_to_index, local_item_to_index
 
 
 def get_collaborative_scores(user_id: int) -> pd.Series:
@@ -155,6 +183,9 @@ def get_content_scores(user_id: int) -> pd.Series:
 
 
 def get_ncf_scores(user_id: int) -> pd.Series:
+    if ncf_model is None or user_to_index is None or item_to_index is None:
+        return pd.Series(dtype=float)
+
     if user_id not in user_to_index:
         return pd.Series(dtype=float)
 
@@ -217,7 +248,6 @@ def fuse_scores(
     fused["content_score"] = content_scores.reindex(fused.index).fillna(0.0)
     fused["ncf_score"] = ncf_scores.reindex(fused.index).fillna(0.0)
 
-    # Score fusion strategy
     fused["hybrid_raw_score"] = (
         0.35 * fused["collaborative_score"] +
         0.25 * fused["content_score"] +
@@ -269,9 +299,10 @@ def cold_start_recommendations(user_id: int, top_n: int) -> pd.DataFrame:
     user_row = users_df.loc[users_df["user_id"] == user_id]
 
     if user_row.empty:
-        fallback = movies_df[[
-            "movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"
-        ]].copy()
+        fallback = movies_df[
+            ["movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"]
+        ].copy()
+
         fallback = fallback.sort_values(
             by=["imdb_rating", "popularity_score"],
             ascending=False
@@ -294,48 +325,16 @@ def cold_start_recommendations(user_id: int, top_n: int) -> pd.DataFrame:
     return fallback
 
 
-def train_ncf_for_api(ratings_df: pd.DataFrame):
-    encoded_ratings_df, local_user_to_index, local_item_to_index, _, _ = encode_ids(ratings_df)
-
-    train_df, valid_df = train_valid_split(
-        encoded_ratings_df,
-        valid_ratio=0.2,
-        random_state=42
-    )
-
-    train_dataset = RatingsDataset(train_df, feedback_type="explicit")
-    valid_dataset = RatingsDataset(valid_df, feedback_type="explicit")
-
-    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=1024, shuffle=False)
-
-    model = NeuralCollaborativeFiltering(
-        num_users=len(local_user_to_index),
-        num_items=len(local_item_to_index),
-        embedding_dim=32,
-        hidden_dims=[128, 64, 32],
-        dropout=0.25
-    )
-
-    model, _ = train_ncf_model(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        feedback_type="explicit",
-        learning_rate=1e-3,
-        weight_decay=1e-5,
-        epochs=10,
-        patience=3
-    )
-
-    return model, local_user_to_index, local_item_to_index
+def validate_service_ready():
+    if users_df is None or movies_df is None or ratings_df is None:
+        raise HTTPException(status_code=500, detail="Service not initialized.")
 
 
 # =========================================================
-# STARTUP
+# LIFESPAN
 # =========================================================
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global users_df, movies_df, ratings_df
     global user_item_matrix, predicted_ratings_df
     global movies_with_desc, tfidf_matrix, content_similarity_df
@@ -349,10 +348,11 @@ def startup_event():
     user_item_matrix_local = create_user_item_matrix(ratings_df)
     normalized_user_item_matrix = create_normalized_user_item_matrix(ratings_df)
 
-    svd_model, user_factors_df, item_factors_df = create_svd_model(
+    _, user_factors_df, item_factors_df = create_svd_model(
         normalized_user_item_matrix,
         n_components=50
     )
+
     predicted_ratings_df_local = create_predicted_rating_matrix(
         normalized_user_item_matrix,
         user_factors_df,
@@ -368,7 +368,11 @@ def startup_event():
         tfidf_matrix_local
     )
 
-    ncf_model_local, user_to_index_local, item_to_index_local = train_ncf_for_api(ratings_df)
+    # Load pre-trained NCF artifacts instead of training on startup
+    try:
+        ncf_model_local, user_to_index_local, item_to_index_local = load_ncf_artifacts()
+    except Exception:
+        ncf_model_local, user_to_index_local, item_to_index_local = None, {}, {}
 
     user_item_matrix = user_item_matrix_local
     predicted_ratings_df = predicted_ratings_df_local
@@ -380,6 +384,19 @@ def startup_event():
     user_to_index = user_to_index_local
     item_to_index = item_to_index_local
 
+    yield
+
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
+app = FastAPI(
+    title="Movie Recommendation Service",
+    description="FastAPI Recommendation API with Hybrid + Similar Items endpoints",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
 
 # =========================================================
 # ROOT
@@ -388,6 +405,7 @@ def startup_event():
 def root():
     return {
         "message": "Movie Recommendation FastAPI Service is running",
+        "docs": "/docs",
         "endpoints": [
             "/recommend/{user_id}",
             "/similar-items/{item_id}"
@@ -396,17 +414,18 @@ def root():
 
 
 # =========================================================
-# /recommend/{user_id}
+# RECOMMEND ENDPOINT
 # =========================================================
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 def recommend(user_id: int, top_n: int = Query(10, ge=1, le=50)):
-    if users_df is None or movies_df is None or ratings_df is None:
-        raise HTTPException(status_code=500, detail="Service not initialized.")
+    validate_service_ready()
 
     user_known = user_id in set(users_df["user_id"].unique())
-    user_has_history = user_id in user_item_matrix.index and not ratings_df.loc[ratings_df["user_id"] == user_id].empty
+    user_has_history = (
+        user_id in user_item_matrix.index
+        and not ratings_df.loc[ratings_df["user_id"] == user_id].empty
+    )
 
-    # Cold-start fallback
     if not user_has_history:
         fallback_df = cold_start_recommendations(user_id, top_n=top_n)
 
@@ -417,7 +436,7 @@ def recommend(user_id: int, top_n: int = Query(10, ge=1, le=50)):
                 genre=str(row["genre"]),
                 language=str(row["language"]),
                 imdb_rating=float(row["imdb_rating"]),
-                popularity_score=float(row["popularity_score"]) if "popularity_score" in row and pd.notna(row["popularity_score"]) else None,
+                popularity_score=float(row["popularity_score"]) if pd.notna(row["popularity_score"]) else None,
                 explanation=str(row["explanation"])
             )
             for _, row in fallback_df.iterrows()
@@ -478,10 +497,12 @@ def recommend(user_id: int, top_n: int = Query(10, ge=1, le=50)):
 
 
 # =========================================================
-# /similar-items/{item_id}
+# SIMILAR ITEMS ENDPOINT
 # =========================================================
 @app.get("/similar-items/{item_id}", response_model=SimilarItemResponse)
 def similar_items(item_id: int, top_n: int = Query(10, ge=1, le=50)):
+    validate_service_ready()
+
     if item_id not in set(movies_df["movie_id"].unique()):
         raise HTTPException(status_code=404, detail=f"movie_id {item_id} not found.")
 
@@ -509,7 +530,7 @@ def similar_items(item_id: int, top_n: int = Query(10, ge=1, le=50)):
                 genre=str(row["genre"]),
                 language=str(row["language"]),
                 imdb_rating=float(row["imdb_rating"]),
-                popularity_score=None,
+                popularity_score=float(row["popularity_score"]) if "popularity_score" in row and pd.notna(row["popularity_score"]) else None,
                 explanation=explanation
             )
         )
